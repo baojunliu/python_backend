@@ -266,6 +266,7 @@ class ModelInstanceState : public BackendModelInstance {
 
   // Decoupled monitor thread
   std::thread decoupled_monitor_;
+  bool decoupled_thread_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::unique_ptr<IPCMessage> received_message_;
@@ -281,6 +282,8 @@ class ModelInstanceState : public BackendModelInstance {
   TRITONSERVER_Error* SetupStubProcess();
   TRITONSERVER_Error* SendMessageToStub(off_t message);
   void ResponseSendDecoupled(std::shared_ptr<IPCMessage> response_send_message);
+  void ResponseCloseDecoupled(
+      std::shared_ptr<IPCMessage> response_close_message);
 
   // Checks whether the stub process is live
   bool IsStubProcessAlive();
@@ -920,7 +923,7 @@ ModelInstanceState::SaveRequestsToSharedMemory(
         std::make_unique<InferRequest>(
             id, correlation_id, pb_input_tensors, requested_output_names,
             model_state->Name(), model_state->Version(), flags,
-            reinterpret_cast<long long>(request));
+            reinterpret_cast<intptr_t>(request));
 
     RETURN_IF_EXCEPTION(infer_request->SaveToSharedMemory(shm_pool_));
     requests_shm[r] = infer_request->ShmHandle();
@@ -998,9 +1001,11 @@ ModelInstanceState::SetupStubProcess()
   parent_pid_ = getpid();
   RETURN_IF_ERROR(StartStubProcess());
 
-  if (model_state->IsDecoupled())
+  if (model_state->IsDecoupled()) {
+    decoupled_thread_ = true;
     decoupled_monitor_ =
         std::thread(&ModelInstanceState::DecoupledMessageQueueMonitor, this);
+  }
 
   return nullptr;
 }
@@ -1345,8 +1350,11 @@ ModelInstanceState::ExecuteBLSRequest(
 void
 ModelInstanceState::DecoupledMessageQueueMonitor()
 {
-  while (true) {
+  while (decoupled_thread_) {
     bi::managed_external_buffer::handle_t handle = parent_message_queue_->Pop();
+    if (handle == DUMMY_MESSAGE) {
+      break;
+    }
     std::unique_ptr<IPCMessage> message =
         IPCMessage::LoadFromSharedMemory(shm_pool_, handle);
 
@@ -1364,7 +1372,7 @@ ModelInstanceState::DecoupledMessageQueueMonitor()
     } else if (message->Command() == PYTHONSTUB_ResponseClose) {
       std::shared_ptr<IPCMessage> response_send_message = std::move(message);
       std::async(std::launch::async, [this, response_send_message]() {
-        ResponseSendDecoupled(response_send_message);
+        ResponseCloseDecoupled(response_send_message);
       });
     }
   }
@@ -1379,22 +1387,72 @@ ModelInstanceState::ResponseSendDecoupled(
 
   ResponseSendMessage* send_message_payload =
       reinterpret_cast<ResponseSendMessage*>(send_message.data_.get());
+  std::unique_ptr<PbString> error_message;
   ScopedDefer _([send_message_payload] {
-    bi::scoped_lock<bi::interprocess_mutex> guard{send_message_payload->mu};
-    send_message_payload->is_stub_turn = true;
-    send_message_payload->cv.notify_all();
+    {
+      bi::scoped_lock<bi::interprocess_mutex> guard{send_message_payload->mu};
+      send_message_payload->is_stub_turn = true;
+      send_message_payload->cv.notify_all();
+
+      while (send_message_payload->is_stub_turn) {
+        send_message_payload->cv.wait(guard);
+      }
+    }
   });
 
   std::unique_ptr<InferResponse> infer_response =
       InferResponse::LoadFromSharedMemory(
           shm_pool_, send_message_payload->response,
           false /* open cuda ipc handle */);
-  std::cout << "Request address on the server side is "
-            << send_message_payload->request_address << std::endl;
 
   TRITONBACKEND_Request* request = reinterpret_cast<TRITONBACKEND_Request*>(
       send_message_payload->request_address);
-  infer_response->Send(request, CudaStream());
+  TRITONSERVER_Error* error = infer_response->Send(request, CudaStream());
+  if (error != nullptr) {
+    send_message_payload->has_error = true;
+    LOG_IF_EXCEPTION(
+        error_message =
+            PbString::Create(shm_pool_, TRITONSERVER_ErrorMessage(error)));
+    send_message_payload->error = error_message->ShmHandle();
+    send_message_payload->is_error_set = true;
+  }
+}
+
+void
+ModelInstanceState::ResponseCloseDecoupled(
+    std::shared_ptr<IPCMessage> response_close_message)
+{
+  AllocatedSharedMemory<ResponseCloseMessage> close_message =
+      shm_pool_->Load<ResponseCloseMessage>(response_close_message->Args());
+
+  ResponseCloseMessage* close_message_payload =
+      reinterpret_cast<ResponseCloseMessage*>(close_message.data_.get());
+  std::unique_ptr<PbString> error_message;
+  ScopedDefer _([close_message_payload] {
+    {
+      bi::scoped_lock<bi::interprocess_mutex> guard{close_message_payload->mu};
+      close_message_payload->is_stub_turn = true;
+      close_message_payload->cv.notify_all();
+
+      while (close_message_payload->is_stub_turn) {
+        close_message_payload->cv.wait(guard);
+      }
+    }
+  });
+
+
+  TRITONBACKEND_Request* request = reinterpret_cast<TRITONBACKEND_Request*>(
+      close_message_payload->request_address);
+  TRITONSERVER_Error* error =
+      TRITONBACKEND_RequestRelease(request, TRITONSERVER_REQUEST_RELEASE_ALL);
+  if (error != nullptr) {
+    close_message_payload->has_error = true;
+    LOG_IF_EXCEPTION(
+        error_message =
+            PbString::Create(shm_pool_, TRITONSERVER_ErrorMessage(error)));
+    close_message_payload->error = error_message->ShmHandle();
+    close_message_payload->is_error_set = true;
+  }
 }
 
 TRITONSERVER_Error*
@@ -1897,9 +1955,16 @@ ModelInstanceState::~ModelInstanceState()
       std::unique_ptr<IPCMessage> ipc_message =
           IPCMessage::Create(shm_pool_, false /* inline_response */);
 
+      ModelState* model_state = reinterpret_cast<ModelState*>(Model());
+      if (model_state->IsDecoupled()) {
+        parent_message_queue_->Push(DUMMY_MESSAGE);
+        decoupled_monitor_.join();
+      }
+
       ipc_message->Command() = PYTHONSTUB_FinalizeRequest;
       stub_message_queue_->Push(ipc_message->ShmHandle());
       parent_message_queue_->Pop();
+
 
       stub_message_queue_.reset();
       parent_message_queue_.reset();

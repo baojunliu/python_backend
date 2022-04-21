@@ -40,7 +40,7 @@ InferRequest::InferRequest(
     const std::vector<std::shared_ptr<PbTensor>>& inputs,
     const std::vector<std::string>& requested_output_names,
     const std::string& model_name, const int64_t model_version,
-    const uint32_t flags, const long long request_address)
+    const uint32_t flags, const intptr_t request_address)
     : request_id_(request_id), correlation_id_(correlation_id), inputs_(inputs),
       requested_output_names_(requested_output_names), model_name_(model_name),
       model_version_(model_version), flags_(flags),
